@@ -7,4 +7,5 @@ numpy
 pyobjc-framework-Quartz
 pyobjc-framework-Cocoa
 huggingface_hub
+pyobjc-framework-AVFoundation
 py2app

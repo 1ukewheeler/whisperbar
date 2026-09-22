@@ -16,12 +16,15 @@ CORRECTIONS_DIR = APP_SUPPORT_DIR / "corrections"
 # now live one file per model instead (see corrections_path()).
 _LEGACY_CORRECTIONS_PATH = APP_SUPPORT_DIR / "corrections.json"
 
-# kVK_F16 - a physical key with no other macOS meaning, safe as a silent PTT trigger.
+# kVK_F16/F17 - physical keys with no other macOS meaning, safe as silent
+# push-to-talk / toggle triggers.
 DEFAULT_PTT_KEYCODE = 106
+DEFAULT_TOGGLE_KEYCODE = 64
 
 DEFAULT_SETTINGS = {
     "model": "mlx-community/parakeet-tdt-0.6b-v2",
     "ptt_keycode": DEFAULT_PTT_KEYCODE,
+    "toggle_keycode": DEFAULT_TOGGLE_KEYCODE,  # None disables the toggle-record key
     "sample_rate": 16000,
     "insert_method": "paste",  # "paste" (pasteboard + Cmd-V, most reliable) or "type" (synthetic keystrokes)
     "launch_at_login": False,

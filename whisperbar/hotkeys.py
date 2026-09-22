@@ -1,7 +1,8 @@
 """Global key monitoring via a Quartz CGEventTap.
 
-Used both for push-to-talk (key-down starts recording, key-up stops it) and
-for the "capture next keypress" flow used by the hotkey picker in the menu.
+Supports multiple independent named bindings (e.g. "ptt" for hold-to-talk,
+"toggle" for press-to-start/press-to-stop) on one shared event tap, plus a
+"capture next keypress" mode used by the hotkey pickers in the menu.
 
 Requires the app to be granted Accessibility + Input Monitoring permission
 in System Settings > Privacy & Security, otherwise CGEventTapCreate returns
@@ -9,6 +10,7 @@ None and start() raises PermissionError.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 import Quartz
@@ -18,21 +20,24 @@ class PermissionError(RuntimeError):
     """Raised when macOS refuses to create the global event tap."""
 
 
+@dataclass
+class _Binding:
+    keycode: Optional[int]
+    on_down: Optional[Callable[[], None]]
+    on_up: Optional[Callable[[], None]]
+    is_down: bool = False
+
+
 class HotkeyManager:
     def __init__(self):
         self._tap = None
         self._run_loop_source = None
-        self._ptt_keycode: Optional[int] = None
-        self._on_press: Optional[Callable[[], None]] = None
-        self._on_release: Optional[Callable[[], None]] = None
-        self._is_down = False
+        self._bindings: dict[str, _Binding] = {}
         self._capture_callback: Optional[Callable[[int], None]] = None
 
-    def start(self, ptt_keycode: int, on_press: Callable[[], None], on_release: Callable[[], None]) -> None:
-        self._ptt_keycode = ptt_keycode
-        self._on_press = on_press
-        self._on_release = on_release
-
+    def start(self) -> None:
+        if self._tap is not None:
+            return  # already started; safe to call again (e.g. a "recheck permissions" retry)
         mask = (
             Quartz.CGEventMaskBit(Quartz.kCGEventKeyDown)
             | Quartz.CGEventMaskBit(Quartz.kCGEventKeyUp)
@@ -68,12 +73,24 @@ class HotkeyManager:
         self._tap = None
         self._run_loop_source = None
 
-    def set_ptt_keycode(self, keycode: int) -> None:
-        self._ptt_keycode = keycode
+    def bind(
+        self,
+        name: str,
+        keycode: Optional[int],
+        on_down: Optional[Callable[[], None]] = None,
+        on_up: Optional[Callable[[], None]] = None,
+    ) -> None:
+        """Registers (or replaces) a named binding. `keycode=None` disables it."""
+        self._bindings[name] = _Binding(keycode=keycode, on_down=on_down, on_up=on_up)
+
+    def set_keycode(self, name: str, keycode: Optional[int]) -> None:
+        if name in self._bindings:
+            self._bindings[name].keycode = keycode
+            self._bindings[name].is_down = False
 
     def capture_next_key(self, callback: Callable[[int], None]) -> None:
         """The next key-down event is reported to `callback(keycode)` instead of
-        being treated as the push-to-talk key. Used by "Change Push-to-Talk Key…"."""
+        triggering any bound action. Used by the "Change key…" menu flow."""
         self._capture_callback = callback
 
     def _handle_event(self, proxy, event_type, event, refcon):  # noqa: ARG002
@@ -93,24 +110,28 @@ class HotkeyManager:
             cb(keycode)
             return event
 
-        if keycode != self._ptt_keycode:
-            return event
-
-        if event_type == Quartz.kCGEventKeyDown:
-            if not self._is_down:
-                self._is_down = True
-                if self._on_press:
-                    self._on_press()
-        elif event_type == Quartz.kCGEventKeyUp:
-            if self._is_down:
-                self._is_down = False
-                if self._on_release:
-                    self._on_release()
+        for binding in self._bindings.values():
+            if keycode != binding.keycode:
+                continue
+            if event_type == Quartz.kCGEventKeyDown:
+                if not binding.is_down:
+                    binding.is_down = True
+                    if binding.on_down:
+                        binding.on_down()
+            elif event_type == Quartz.kCGEventKeyUp:
+                if binding.is_down:
+                    binding.is_down = False
+                    if binding.on_up:
+                        binding.on_up()
 
         return event
 
 
-# macOS virtual keycode names for common PTT-friendly keys (no default OS meaning).
+# macOS virtual keycodes for the function-row keys beyond F12: no default
+# OS meaning, and (unlike modifier keys such as Option/Command, which only
+# generate flagsChanged events our tap doesn't listen for) they generate
+# ordinary keyDown/keyUp, so they work as both a "press it" capture target
+# and a plain named menu choice.
 KEY_NAMES = {
     105: "F13",
     107: "F14",
@@ -121,7 +142,10 @@ KEY_NAMES = {
     80: "F19",
     90: "F20",
 }
+NAME_TO_KEYCODE = {name: code for code, name in KEY_NAMES.items()}
 
 
-def keycode_name(keycode: int) -> str:
+def keycode_name(keycode: Optional[int]) -> str:
+    if keycode is None:
+        return "None"
     return KEY_NAMES.get(keycode, f"Key {keycode}")

@@ -13,8 +13,14 @@ from . import config
 from .audio import AudioRecorder
 from .corrections import CorrectionsStore
 from .cursor_overlay import CursorOverlay
-from .hotkeys import HotkeyManager, PermissionError as HotkeyPermissionError, keycode_name
+from .hotkeys import (
+    NAME_TO_KEYCODE,
+    HotkeyManager,
+    PermissionError as HotkeyPermissionError,
+    keycode_name,
+)
 from .inserter import insert_text
+from . import permissions
 from .rules import RuleEngine
 from . import transcribe as transcribe_mod
 
@@ -63,10 +69,14 @@ class WhisperBarApp(rumps.App):
         self.last_transcription: str | None = None
         self.last_transcription_model: str | None = None
         self._downloading = False
+        self._recording = False
+        self._hotkey_permission_ok = False
 
+        self.permissions_menu = rumps.MenuItem("Permissions")
         self.model_menu = rumps.MenuItem("Model")
         self.language_menu = rumps.MenuItem("Language")
-        self.ptt_menu_item = rumps.MenuItem(self._ptt_label(), callback=self._change_ptt_key)
+        self.ptt_menu_item = rumps.MenuItem("Push-to-Talk Key")
+        self.toggle_menu_item = rumps.MenuItem("Toggle Recording Key")
         self.rules_menu = rumps.MenuItem("Rules")
         self.numbers_toggle = rumps.MenuItem(
             "Convert spoken numbers to digits", callback=self._toggle_numbers_rule
@@ -80,9 +90,12 @@ class WhisperBarApp(rumps.App):
         )
 
         self.menu = [
+            self.permissions_menu,
+            None,
             self.model_menu,
             self.language_menu,
             self.ptt_menu_item,
+            self.toggle_menu_item,
             self.rules_menu,
             self.corrections_menu,
             None,
@@ -93,22 +106,78 @@ class WhisperBarApp(rumps.App):
 
         self._rebuild_model_menu()
         self._rebuild_language_menu()
+        self._rebuild_ptt_menu()
+        self._rebuild_toggle_menu()
         self._rebuild_rules_menu()
         self._rebuild_corrections_menu()
         self.launch_at_login_item.state = self.settings.get("launch_at_login", False)
 
         self._start_hotkeys()
+        self._rebuild_permissions_menu()
         self._ensure_default_model()
 
     # ---- setup -----------------------------------------------------
 
     def _start_hotkeys(self) -> None:
         try:
-            self.hotkeys.start(
-                self.settings["ptt_keycode"], self._on_ptt_press, self._on_ptt_release
+            self.hotkeys.start()
+            self.hotkeys.bind(
+                "ptt", self.settings["ptt_keycode"], on_down=self._on_ptt_press, on_up=self._on_ptt_release
             )
+            self.hotkeys.bind("toggle", self.settings.get("toggle_keycode"), on_down=self._on_toggle_press)
+            self._hotkey_permission_ok = True
         except HotkeyPermissionError as exc:
+            self._hotkey_permission_ok = False
             rumps.notification("WhisperBar", "Permission needed", str(exc))
+
+    # ---- permissions menu -------------------------------------------------
+    #
+    # macOS deliberately doesn't let an app flip these on itself -- these
+    # are one-click jumps to the right System Settings pane plus a status
+    # readout, not an actual grant. "Recheck" re-attempts creating the
+    # event tap (harmless if it already succeeded, see HotkeyManager.start)
+    # so you don't have to relaunch the whole app after granting.
+
+    _MIC_STATUS_LABELS = {
+        "granted": "✅ Granted",
+        "denied": "❌ Denied",
+        "restricted": "🚫 Restricted",
+        "not_determined": "⚪ Not requested yet",
+        "unknown": "❓ Unknown",
+    }
+
+    def _rebuild_permissions_menu(self) -> None:
+        _clear_menu(self.permissions_menu)
+        mic_label = self._MIC_STATUS_LABELS.get(permissions.microphone_status(), "❓ Unknown")
+        hotkey_label = "✅ Working" if self._hotkey_permission_ok else "❌ Needs permission"
+        self.permissions_menu.add(rumps.MenuItem(f"Microphone: {mic_label}", callback=None))
+        self.permissions_menu.add(rumps.MenuItem(f"Accessibility & Input Monitoring: {hotkey_label}", callback=None))
+        self.permissions_menu.add(None)
+        self.permissions_menu.add(
+            rumps.MenuItem("Open Microphone Settings…", callback=lambda _s: permissions.open_pane("microphone"))
+        )
+        self.permissions_menu.add(
+            rumps.MenuItem(
+                "Open Accessibility Settings…", callback=lambda _s: permissions.open_pane("accessibility")
+            )
+        )
+        self.permissions_menu.add(
+            rumps.MenuItem(
+                "Open Input Monitoring Settings…",
+                callback=lambda _s: permissions.open_pane("input_monitoring"),
+            )
+        )
+        self.permissions_menu.add(None)
+        self.permissions_menu.add(rumps.MenuItem("Recheck Permissions", callback=self._recheck_permissions))
+
+    def _recheck_permissions(self, _sender) -> None:
+        self._start_hotkeys()
+        self._rebuild_permissions_menu()
+        rumps.notification(
+            "WhisperBar",
+            "Permissions rechecked",
+            "Accessibility & Input Monitoring: " + ("working" if self._hotkey_permission_ok else "still needs permission"),
+        )
 
     def _ensure_default_model(self) -> None:
         installed = transcribe_mod.list_installed_models()
@@ -137,15 +206,33 @@ class WhisperBarApp(rumps.App):
         rumps.notification("WhisperBar", "Downloading model", f"{model} (first run only)")
         transcribe_mod.download_model_async(model, on_done)
 
-    # ---- push-to-talk ------------------------------------------------
+    # ---- push-to-talk / toggle recording ---------------------------------
 
     def _on_ptt_press(self) -> None:
+        self._request_start_recording()
+
+    def _on_ptt_release(self) -> None:
+        self._request_stop_recording()
+
+    def _on_toggle_press(self) -> None:
+        # Single key, press to start, press again to stop -- as opposed to
+        # push-to-talk's hold semantics. Both funnel into the same
+        # start/stop machinery and share self._recording, so whichever key
+        # started a recording, either can be used interchangeably to check
+        # state (though only the one that started it makes sense to use).
+        if self._recording:
+            self._request_stop_recording()
+        else:
+            self._request_start_recording()
+
+    def _request_start_recording(self) -> None:
         # This runs on the CGEventTap callback, i.e. the main thread -- it
         # must return immediately no matter what PortAudio does, so the
         # actual start() call is dispatched to the audio-io executor rather
         # than called here directly.
-        if self._downloading:
+        if self._downloading or self._recording:
             return
+        self._recording = True
         AppHelper.callAfter(setattr, self, "title", ICON_RECORDING)
         AppHelper.callAfter(self.cursor_overlay.show)
         self._audio_executor.submit(self._start_recording_safe)
@@ -154,11 +241,18 @@ class WhisperBarApp(rumps.App):
         try:
             self.recorder.start()
         except Exception as exc:  # noqa: BLE001
+            self._recording = False
+            AppHelper.callAfter(setattr, self, "title", ICON_IDLE)
+            AppHelper.callAfter(self.cursor_overlay.hide)
             AppHelper.callAfter(lambda: rumps.notification("WhisperBar", "Recording failed", str(exc)))
 
-    def _on_ptt_release(self) -> None:
-        # Same constraint as _on_ptt_press: never block the main thread, so
-        # even the *wait* for stop() to finish happens on its own thread.
+    def _request_stop_recording(self) -> None:
+        # Same constraint as _request_start_recording: never block the main
+        # thread, so even the *wait* for stop() to finish happens on its
+        # own thread.
+        if not self._recording:
+            return
+        self._recording = False
         AppHelper.callAfter(self.cursor_overlay.hide)
         threading.Thread(target=self._stop_recording_and_process, daemon=True).start()
 
@@ -223,9 +317,6 @@ class WhisperBarApp(rumps.App):
             AppHelper.callAfter(setattr, self, "title", ICON_IDLE)
 
     # ---- model menu ----------------------------------------------------
-
-    def _ptt_label(self) -> str:
-        return f"Push-to-Talk Key: {keycode_name(self.settings['ptt_keycode'])}"
 
     def _rebuild_model_menu(self) -> None:
         _clear_menu(self.model_menu)
@@ -302,7 +393,37 @@ class WhisperBarApp(rumps.App):
         rumps.notification("WhisperBar", "Downloading model", repo_id)
         transcribe_mod.download_model_async(repo_id, on_done)
 
-    # ---- push-to-talk key picker ----------------------------------------
+    # ---- push-to-talk / toggle key pickers -------------------------------
+    #
+    # Each key can be set two ways: click its name directly from the
+    # submenu's list of F13-F20 (no need to know/press the physical key
+    # blind -- useful since not every keyboard has all of them without a
+    # remap), or "Press a key to set…" to capture whatever's actually
+    # pressed, including non-F-row keys. Both write through the same
+    # settings + HotkeyManager update path.
+
+    def _rebuild_ptt_menu(self) -> None:
+        _clear_menu(self.ptt_menu_item)
+        self.ptt_menu_item.title = f"Push-to-Talk Key: {keycode_name(self.settings['ptt_keycode'])}"
+        self.ptt_menu_item.add(rumps.MenuItem("Press a key to set…", callback=self._change_ptt_key))
+        self.ptt_menu_item.add(None)
+        current = self.settings["ptt_keycode"]
+        for name, code in NAME_TO_KEYCODE.items():
+            item = rumps.MenuItem(name, callback=self._select_ptt_key)
+            item.state = code == current
+            self.ptt_menu_item.add(item)
+
+    def _select_ptt_key(self, sender: rumps.MenuItem) -> None:
+        code = NAME_TO_KEYCODE.get(sender.title)
+        if code is None:
+            return
+        if code == self.settings.get("toggle_keycode"):
+            rumps.notification("WhisperBar", "Key already in use", f"{sender.title} is set as the Toggle Recording key.")
+            return
+        self.settings["ptt_keycode"] = code
+        config.save_settings(self.settings)
+        self.hotkeys.set_keycode("ptt", code)
+        self._rebuild_ptt_menu()
 
     def _change_ptt_key(self, _sender) -> None:
         rumps.notification(
@@ -310,13 +431,77 @@ class WhisperBarApp(rumps.App):
         )
 
         def _captured(keycode: int):
+            if keycode == self.settings.get("toggle_keycode"):
+                AppHelper.callAfter(
+                    lambda: rumps.notification(
+                        "WhisperBar", "Key already in use", "That key is set as the Toggle Recording key."
+                    )
+                )
+                return
             self.settings["ptt_keycode"] = keycode
             config.save_settings(self.settings)
-            self.hotkeys.set_ptt_keycode(keycode)
+            self.hotkeys.set_keycode("ptt", keycode)
 
             def _update_ui():
-                self.ptt_menu_item.title = self._ptt_label()
+                self._rebuild_ptt_menu()
                 rumps.notification("WhisperBar", "Push-to-talk key set", keycode_name(keycode))
+
+            AppHelper.callAfter(_update_ui)
+
+        self.hotkeys.capture_next_key(_captured)
+
+    def _rebuild_toggle_menu(self) -> None:
+        _clear_menu(self.toggle_menu_item)
+        code = self.settings.get("toggle_keycode")
+        self.toggle_menu_item.title = f"Toggle Recording Key: {keycode_name(code) if code is not None else 'Disabled'}"
+        self.toggle_menu_item.add(rumps.MenuItem("Press a key to set…", callback=self._change_toggle_key))
+        disable_item = rumps.MenuItem("Disable", callback=self._disable_toggle_key)
+        disable_item.state = code is None
+        self.toggle_menu_item.add(disable_item)
+        self.toggle_menu_item.add(None)
+        for name, kcode in NAME_TO_KEYCODE.items():
+            item = rumps.MenuItem(name, callback=self._select_toggle_key)
+            item.state = kcode == code
+            self.toggle_menu_item.add(item)
+
+    def _select_toggle_key(self, sender: rumps.MenuItem) -> None:
+        code = NAME_TO_KEYCODE.get(sender.title)
+        if code is None:
+            return
+        if code == self.settings.get("ptt_keycode"):
+            rumps.notification("WhisperBar", "Key already in use", f"{sender.title} is set as the Push-to-Talk key.")
+            return
+        self.settings["toggle_keycode"] = code
+        config.save_settings(self.settings)
+        self.hotkeys.set_keycode("toggle", code)
+        self._rebuild_toggle_menu()
+
+    def _disable_toggle_key(self, _sender) -> None:
+        self.settings["toggle_keycode"] = None
+        config.save_settings(self.settings)
+        self.hotkeys.set_keycode("toggle", None)
+        self._rebuild_toggle_menu()
+
+    def _change_toggle_key(self, _sender) -> None:
+        rumps.notification(
+            "WhisperBar", "Press a key", "Press the key you want to use to toggle recording…"
+        )
+
+        def _captured(keycode: int):
+            if keycode == self.settings.get("ptt_keycode"):
+                AppHelper.callAfter(
+                    lambda: rumps.notification(
+                        "WhisperBar", "Key already in use", "That key is set as the Push-to-Talk key."
+                    )
+                )
+                return
+            self.settings["toggle_keycode"] = keycode
+            config.save_settings(self.settings)
+            self.hotkeys.set_keycode("toggle", keycode)
+
+            def _update_ui():
+                self._rebuild_toggle_menu()
+                rumps.notification("WhisperBar", "Toggle key set", keycode_name(keycode))
 
             AppHelper.callAfter(_update_ui)
 

@@ -9,7 +9,12 @@ dock icon.
 
 ## Features
 
-- **Push-to-talk dictation**, any key you like (defaults to F16).
+- **Push-to-talk dictation**, any key you like (defaults to F16), *and* a
+  separate **toggle-recording key** (defaults to F17) if you'd rather press
+  once to start and again to stop than hold the whole time.
+- **Pick either key by clicking its name from a list, or by pressing it** —
+  no need to guess which physical key maps to what, or dig into a remap
+  tool first.
 - **Two model backends**: OpenAI Whisper (`mlx_whisper`) and NVIDIA Parakeet
   (`parakeet_mlx`, roughly 10x faster for short clips) — switch between any
   installed model from the menu, no restart needed.
@@ -23,6 +28,9 @@ dock icon.
 - **Language selection**: pin transcription to a specific language to stop
   short/ambiguous audio from occasionally getting misidentified as some
   other language, or leave it on auto-detect.
+- **One-click permission setup**: a menu that shows current Microphone/
+  Accessibility/Input Monitoring status and jumps straight to the right
+  System Settings pane — no hunting through Privacy & Security by hand.
 - A red-dot cursor indicator while recording, so it's obvious when
   push-to-talk is active.
 
@@ -62,11 +70,19 @@ open /Applications/WhisperBar.app
 
 ### Permissions
 
-Open **System Settings → Privacy & Security** and enable WhisperBar under:
+Open the menu bar icon → **Permissions**. It shows current status for each
+of the three permissions WhisperBar needs and has a button to jump straight
+to the right System Settings pane for each:
 - **Microphone** — to record while push-to-talk is held.
 - **Accessibility** — to type text into other apps.
 - **Input Monitoring** — to detect the push-to-talk key globally, even when
   WhisperBar isn't the focused app.
+
+macOS doesn't let an app grant these to itself (that's a deliberate security
+boundary) — you still click the checkbox yourself once each pane is open —
+but nothing here requires you to find Privacy & Security manually. After
+granting, use **Permissions → Recheck Permissions** rather than relaunching
+the whole app.
 
 If you rebuild the app (`./build_app.sh` again), macOS treats it as a new
 binary and these permissions go stale — remove WhisperBar from each list
@@ -103,8 +119,12 @@ docstring for why it's split out that way).
 - **Push-to-talk**: hold the key (default **F16**), speak, release. The menu
   bar icon shows 🎙 idle, 🔴 recording, ⏳ transcribing, and a small red dot
   follows your cursor while recording.
-- **Change the key**: menu → **Push-to-Talk Key: F16** → click it, then
-  press whatever key you want to use instead.
+- **Toggle recording**: press the toggle key (default **F17**) once to
+  start, once more to stop — an alternative to holding.
+- **Change either key**: menu → **Push-to-Talk Key** or **Toggle Recording
+  Key** → either click a key name directly from the list (F13–F20), or
+  **"Press a key to set…"** to capture any other key by pressing it. The
+  toggle key can also be turned off entirely from its own submenu.
 - **Switch models**: menu → **Model** → pick one.
 - **Language**: menu → **Language** (Whisper models only — Parakeet has no
   per-call language control; use the English-only `v2` checkpoint if you
@@ -124,7 +144,7 @@ docstring for why it's split out that way).
 ## Data locations
 
 All config lives in `~/Library/Application Support/WhisperBar/`:
-- `settings.json` — active model, language, push-to-talk key, insert method.
+- `settings.json` — active model, language, push-to-talk/toggle keys, insert method.
 - `rules.json` — your text-transform rules.
 - `corrections/<model-name>.json` — learned mistake → fix phrases, one file
   per model.
