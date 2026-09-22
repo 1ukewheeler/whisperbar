@@ -1,0 +1,10 @@
+rumps
+mlx-whisper
+parakeet-mlx
+soundfile
+sounddevice
+numpy
+pyobjc-framework-Quartz
+pyobjc-framework-Cocoa
+huggingface_hub
+py2app
