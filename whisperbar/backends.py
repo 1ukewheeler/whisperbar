@@ -10,10 +10,6 @@ subclass, not touching the rest of the pipeline.
 """
 from __future__ import annotations
 
-import tempfile
-import threading
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -92,15 +88,8 @@ class ParakeetBackend(Backend):
     encoder pass -- but it's a different package with a different loading
     and inference API, hence its own Backend implementation.
 
-    parakeet_mlx's loaded model carries MLX state that's affined to
-    whichever OS thread first loaded it (confirmed by reproduction: loading
-    on one thread and calling .transcribe() on another raises
-    "There is no Stream(cpu, 1) in current thread", even though the same
-    pattern is fine for mlx_whisper). Our caller spawns a fresh
-    threading.Thread per push-to-talk press, so loading and every
-    transcription must be pinned to one persistent worker thread rather
-    than whatever thread happens to call in -- a single-worker
-    ThreadPoolExecutor gives exactly that.
+    Like every backend, only ever called on transcribe.py's single MLX
+    worker thread (see there for why).
     """
 
     name = "parakeet"
@@ -110,8 +99,6 @@ class ParakeetBackend(Backend):
     # here). The Language menu is a no-op for this backend; use an
     # English-only checkpoint like parakeet-tdt-0.6b-v2 for guaranteed English.
     supports_language = False
-    _lock = threading.Lock()
-    _executor: Optional[ThreadPoolExecutor] = None
     _loaded_repo: Optional[str] = None
     _loaded_model = None
 
@@ -123,13 +110,7 @@ class ParakeetBackend(Backend):
             "model.safetensors" in filenames or "weights.safetensors" in filenames
         )
 
-    def _get_executor(self) -> ThreadPoolExecutor:
-        if self._executor is None:
-            self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="parakeet")
-        return self._executor
-
     def _model(self, model_repo: str):
-        # Runs on the executor's single worker thread.
         if self._loaded_model is None or self._loaded_repo != model_repo:
             import locale
 
@@ -151,24 +132,27 @@ class ParakeetBackend(Backend):
             self._loaded_repo = model_repo
         return self._loaded_model
 
-    def _transcribe_on_worker_thread(self, audio: np.ndarray, sample_rate: int, model_repo: str) -> str:
-        import soundfile as sf
-
-        model = self._model(model_repo)
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
-            sf.write(f.name, audio, sample_rate)
-            result = model.transcribe(Path(f.name))
-        return result.text.strip()
-
     def transcribe(
         self, audio: np.ndarray, sample_rate: int, model_repo: str, language: Optional[str] = None
     ) -> str:
+        import mlx.core as mx
+        from parakeet_mlx.audio import get_logmel
+
         if len(audio) == 0:
             return ""
-        with self._lock:
-            executor = self._get_executor()
-            future = executor.submit(self._transcribe_on_worker_thread, audio, sample_rate, model_repo)
-        return future.result()
+        model = self._model(model_repo)
+        # Feed the samples straight in rather than via model.transcribe(path):
+        # that decodes files by shelling out to `ffmpeg`, which isn't on the
+        # minimal PATH a Finder/login-launched app gets (no /opt/homebrew/bin),
+        # so it failed only when run as WhisperBar.app. This is what
+        # transcribe() does after decoding.
+        target_rate = model.preprocessor_config.sample_rate
+        if sample_rate != target_rate:
+            import librosa
+
+            audio = librosa.resample(audio, orig_sr=sample_rate, target_sr=target_rate)
+        mel = get_logmel(mx.array(audio.astype(np.float32)), model.preprocessor_config)
+        return model.generate(mel)[0].text.strip()
 
 
 BACKENDS: list[Backend] = [WhisperBackend(), ParakeetBackend()]

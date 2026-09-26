@@ -6,12 +6,15 @@ tests/audio/generate.sh) through every installed model, replicating the
 app's actual threading pattern: preload on one background thread, then
 transcribe each press on a fresh background thread -- this is what exposed
 the Parakeet cross-thread MLX Stream bug that plain single-threaded testing
-missed.
+missed. It then fires several transcriptions at once from separate threads
+(a press while an earlier one is still transcribing), which used to
+deadlock mlx_whisper and leave the app stuck on the transcribing icon.
 
 Usage: .venv/bin/python3 tests/test_transcribe.py
 """
 from __future__ import annotations
 
+import os
 import sys
 import threading
 import time
@@ -21,6 +24,11 @@ import numpy as np
 import soundfile as sf
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# The PATH a Finder/login-launched WhisperBar.app actually gets -- no
+# /opt/homebrew/bin. A shell's PATH hid a Parakeet dependency on `ffmpeg`
+# that only broke in the real app.
+os.environ["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin"
 
 from whisperbar import transcribe  # noqa: E402
 
@@ -60,6 +68,37 @@ def _run_on_own_thread(fn, *args):
     return box["result"]
 
 
+CONCURRENT_CALLERS = 4
+CONCURRENT_ROUNDS = 5
+CONCURRENT_TIMEOUT_SECONDS = 120
+
+
+def _check_concurrent(model: str) -> int:
+    path = AUDIO_DIR / "short.wav"
+    if not path.exists():
+        return 0
+    audio, sr = sf.read(str(path), dtype="float32")
+    errors: list[str] = []
+
+    def _call():
+        try:
+            transcribe.transcribe(audio, model, sr, timeout=CONCURRENT_TIMEOUT_SECONDS)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(repr(exc))
+
+    t0 = time.time()
+    for _ in range(CONCURRENT_ROUNDS):
+        threads = [threading.Thread(target=_call) for _ in range(CONCURRENT_CALLERS)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    total = CONCURRENT_ROUNDS * CONCURRENT_CALLERS
+    status = "ok" if not errors else "FAIL"
+    print(f"  [{status}] {total} concurrent calls ({time.time() - t0:.2f}s)" + (f": {errors[:3]}" if errors else ""))
+    return 1 if errors else 0
+
+
 def main() -> int:
     failures = 0
 
@@ -91,6 +130,8 @@ def main() -> int:
             if missing:
                 failures += 1
             print(f"  [{status}] {filename} ({elapsed:.2f}s): {text!r}" + (f"  missing={missing}" if missing else ""))
+
+        failures += _check_concurrent(model)
 
     print(f"\n{'PASSED' if failures == 0 else f'{failures} FAILURE(S)'}")
     return 1 if failures else 0

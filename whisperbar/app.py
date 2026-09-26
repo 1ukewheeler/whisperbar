@@ -1,12 +1,14 @@
 """WhisperBar: a menu-bar-only push-to-talk MLX dictation app."""
 from __future__ import annotations
 
+import os
 import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
 import rumps
-from AppKit import NSApplication, NSApplicationActivationPolicyAccessory
+from AppKit import NSApplication, NSApplicationActivationPolicyAccessory, NSBundle
 from PyObjCTools import AppHelper
 
 from . import config
@@ -31,6 +33,11 @@ MIN_RECORDING_SECONDS = 0.2
 # forever). Bounding the wait keeps the app responsive even when that
 # happens, at the cost of abandoning that one recording.
 AUDIO_IO_TIMEOUT_SECONDS = 5
+# Upper bound on one transcription (including a cold model load) before we
+# assume the MLX worker thread is wedged. Real runs take a few seconds;
+# the per-second allowance covers long toggle-key recordings.
+TRANSCRIBE_TIMEOUT_BASE_SECONDS = 60
+TRANSCRIBE_TIMEOUT_PER_AUDIO_SECOND = 1.0
 
 ICON_IDLE = "🎙"
 ICON_RECORDING = "🔴"
@@ -70,6 +77,11 @@ class WhisperBarApp(rumps.App):
         self.last_transcription_model: str | None = None
         self._downloading = False
         self._recording = False
+        # Transcriptions queue up on one MLX thread (see transcribe.py), so
+        # a new press can finish recording while an earlier one is still
+        # transcribing -- only drop the ⏳ icon once all of them are done.
+        self._pending_transcriptions = 0
+        self._pending_lock = threading.Lock()
         self._hotkey_permission_ok = False
 
         self.permissions_menu = rumps.MenuItem("Permissions")
@@ -242,7 +254,7 @@ class WhisperBarApp(rumps.App):
             self.recorder.start()
         except Exception as exc:  # noqa: BLE001
             self._recording = False
-            AppHelper.callAfter(setattr, self, "title", ICON_IDLE)
+            AppHelper.callAfter(self._set_idle_title_if_done)
             AppHelper.callAfter(self.cursor_overlay.hide)
             AppHelper.callAfter(lambda: rumps.notification("WhisperBar", "Recording failed", str(exc)))
 
@@ -261,7 +273,7 @@ class WhisperBarApp(rumps.App):
         try:
             audio = future.result(timeout=AUDIO_IO_TIMEOUT_SECONDS)
         except FutureTimeoutError:
-            AppHelper.callAfter(setattr, self, "title", ICON_IDLE)
+            AppHelper.callAfter(self._set_idle_title_if_done)
             AppHelper.callAfter(
                 lambda: rumps.notification(
                     "WhisperBar", "Recording got stuck", "Recovered automatically -- try again."
@@ -270,13 +282,15 @@ class WhisperBarApp(rumps.App):
             self._recover_stuck_audio()
             return
         except Exception as exc:  # noqa: BLE001
-            AppHelper.callAfter(setattr, self, "title", ICON_IDLE)
+            AppHelper.callAfter(self._set_idle_title_if_done)
             AppHelper.callAfter(lambda: rumps.notification("WhisperBar", "Recording failed", str(exc)))
             return
 
         if self.recorder.duration_seconds(audio) < MIN_RECORDING_SECONDS:
-            AppHelper.callAfter(setattr, self, "title", ICON_IDLE)
+            AppHelper.callAfter(self._set_idle_title_if_done)
             return
+        with self._pending_lock:
+            self._pending_transcriptions += 1
         AppHelper.callAfter(setattr, self, "title", ICON_TRANSCRIBING)
         self._process_audio(audio)
 
@@ -289,12 +303,17 @@ class WhisperBarApp(rumps.App):
         self.recorder = AudioRecorder(sample_rate=self.settings["sample_rate"])
 
     def _process_audio(self, audio) -> None:
+        timeout = (
+            TRANSCRIBE_TIMEOUT_BASE_SECONDS
+            + TRANSCRIBE_TIMEOUT_PER_AUDIO_SECOND * self.recorder.duration_seconds(audio)
+        )
         try:
             raw_text = transcribe_mod.transcribe(
                 audio,
                 self.settings["model"],
                 sample_rate=self.settings["sample_rate"],
                 language=self.settings.get("language"),
+                timeout=timeout,
             )
             text = self.corrections.apply(self.settings["model"], raw_text)
             text = self.rules.apply(text)
@@ -308,13 +327,32 @@ class WhisperBarApp(rumps.App):
                     self.correct_last_item.set_callback(self._correct_last)
 
                 AppHelper.callAfter(_enable)
+        except transcribe_mod.TranscriptionTimeout:
+            # The loaded model is bound to the stuck MLX thread, so there's
+            # no in-process recovery -- restart cleanly instead of sitting
+            # on ⏳ forever.
+            AppHelper.callAfter(self._restart_after_stuck_transcription)
         except Exception as exc:  # noqa: BLE001
             def _notify():
                 rumps.notification("WhisperBar", "Transcription failed", str(exc))
 
             AppHelper.callAfter(_notify)
         finally:
-            AppHelper.callAfter(setattr, self, "title", ICON_IDLE)
+            with self._pending_lock:
+                self._pending_transcriptions -= 1
+            AppHelper.callAfter(self._set_idle_title_if_done)
+
+    def _set_idle_title_if_done(self) -> None:
+        with self._pending_lock:
+            busy = self._pending_transcriptions > 0
+        if not self._recording and not self._downloading:
+            self.title = ICON_TRANSCRIBING if busy else ICON_IDLE
+
+    def _restart_after_stuck_transcription(self) -> None:
+        rumps.notification(
+            "WhisperBar", "Transcription got stuck", "Restarting WhisperBar -- try again in a few seconds."
+        )
+        _relaunch()
 
     # ---- model menu ----------------------------------------------------
 
@@ -591,10 +629,24 @@ class WhisperBarApp(rumps.App):
         # that state. os._exit() skips all of that -- fine here since
         # nothing in this app buffers state that isn't already written to
         # disk immediately (config.save_settings() etc.).
-        import os
-
         self.hotkeys.stop()
         os._exit(0)
+
+
+def _relaunch() -> None:
+    """Replaces this process with a fresh instance. os._exit() for the same
+    reason as _quit(): a wedged worker thread would block normal shutdown."""
+    bundle_path = NSBundle.mainBundle().bundlePath()
+    if bundle_path.endswith(".app"):
+        # Relaunch via LaunchServices (exec'ing would break the bundle's
+        # window-server connection, see build_app.sh). The delay lets this
+        # instance exit first so two event taps never run at once.
+        subprocess.Popen(
+            ["/bin/sh", "-c", 'sleep 1; open "$0"', bundle_path], start_new_session=True
+        )
+        os._exit(0)
+    # Running main.py directly from a terminal during development.
+    os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
 def _hide_dock_icon() -> None:

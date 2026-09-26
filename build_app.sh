@@ -26,15 +26,52 @@ if [ ! -x "${PROJECT_DIR}/.venv/bin/python3" ]; then
     exit 1
 fi
 
+# Stable code signing identity. py2app signs ad-hoc, and macOS ties
+# Accessibility / Input Monitoring / Microphone grants to an ad-hoc
+# signature's exact hash -- so every rebuild silently revoked them. Signing
+# with one persistent self-signed certificate instead makes the app's
+# identity "com.whisperbar.app + this certificate", which survives rebuilds.
+# The certificate is created in the login keychain on first run. It's only
+# ever used locally, so it doesn't need to be trusted (codesign accepts it
+# by SHA-1 hash).
+SIGNING_NAME="WhisperBar Local Signing"
+
+signing_identity_hash() {
+    { security find-certificate -c "${SIGNING_NAME}" -Z 2>/dev/null || true; } | awk '/^SHA-1 hash:/ {print $3; exit}'
+}
+
+create_signing_identity() {
+    local tmp
+    tmp="$(mktemp -d)"
+    # /usr/bin/openssl (LibreSSL) on purpose: its PKCS#12 encryption is what
+    # `security import` understands; Homebrew OpenSSL 3's default isn't.
+    /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+        -subj "/CN=${SIGNING_NAME}" \
+        -addext "keyUsage=critical,digitalSignature" \
+        -addext "extendedKeyUsage=critical,codeSigning" \
+        -keyout "${tmp}/key.pem" -out "${tmp}/cert.pem" 2>/dev/null
+    /usr/bin/openssl pkcs12 -export -inkey "${tmp}/key.pem" -in "${tmp}/cert.pem" \
+        -name "${SIGNING_NAME}" -passout pass:whisperbar -out "${tmp}/identity.p12"
+    security import "${tmp}/identity.p12" -P whisperbar -T /usr/bin/codesign >/dev/null
+    rm -rf "${tmp}"
+    echo "Created code signing certificate \"${SIGNING_NAME}\" in your login keychain."
+}
+
+SIGNING_HASH="$(signing_identity_hash)"
+if [ -z "${SIGNING_HASH}" ]; then
+    create_signing_identity
+    SIGNING_HASH="$(signing_identity_hash)"
+fi
+
 cd "${PROJECT_DIR}"
 rm -rf build dist
 .venv/bin/python3 setup.py py2app -A --dist-dir dist >/dev/null
+codesign --force --sign "${SIGNING_HASH}" --identifier com.whisperbar.app "dist/${APP_NAME}.app"
 
 rm -rf "${DEST}"
 mkdir -p "$(dirname "${DEST}")"
 mv "dist/${APP_NAME}.app" "${DEST}"
 rm -rf build dist
 
-echo "Built ${DEST}"
+echo "Built ${DEST} (signed with \"${SIGNING_NAME}\" -- permissions carry over between rebuilds)"
 echo "This launcher runs the project's venv in place -- keep ${PROJECT_DIR} where it is."
-echo "First launch: right-click ${APP_NAME}.app in Finder > Open (macOS will ask you to confirm once, since it's unsigned)."
